@@ -309,6 +309,7 @@ class LayeredFilesystem:
         """查找叠加后路径实际对应的 (文件所在层的绝对路径, 层索引)。
 
         若路径被 whiteout 删除或不存在, 返回 (None, None)。
+        注意: 若某祖先目录被 whiteout (删除目录), 则该路径也视为不存在。
         """
         p = abs_path.lstrip("/").replace("\\", "/")
         if p == "" or p == ".":
@@ -321,20 +322,42 @@ class LayeredFilesystem:
         opaque_until_layer = -1  # 遇到 opaque 后只查 >= 此值的层
         while layer_idx > opaque_until_layer:
             layer = self.layers[layer_idx]
-            # 先检查路径本身是否被本层 whiteout
-            wh_file = os.path.join(layer.root, os.path.dirname(p), WHITEOUT_PREFIX + os.path.basename(p)) if os.path.dirname(p) else os.path.join(layer.root, WHITEOUT_PREFIX + os.path.basename(p))
+            # 检查: 路径本身或任何祖先目录是否被本层 whiteout
+            wh_found = False
+            # 先检查路径本身的 whiteout
+            wh_file = (
+                os.path.join(layer.root, os.path.dirname(p), WHITEOUT_PREFIX + os.path.basename(p))
+                if os.path.dirname(p)
+                else os.path.join(layer.root, WHITEOUT_PREFIX + os.path.basename(p))
+            )
             if os.path.exists(wh_file):
+                wh_found = True
+            # 再逐级检查祖先目录的 whiteout
+            if not wh_found:
+                for i in range(1, len(parts)):
+                    anc = "/".join(parts[:i])
+                    anc_parent = os.path.dirname(anc).replace("\\", "/")
+                    anc_name = os.path.basename(anc)
+                    anc_wh = (
+                        os.path.join(layer.root, anc_parent, WHITEOUT_PREFIX + anc_name)
+                        if anc_parent
+                        else os.path.join(layer.root, WHITEOUT_PREFIX + anc_name)
+                    )
+                    if os.path.exists(anc_wh):
+                        wh_found = True
+                        break
+            if wh_found:
                 return None, None
+
             # 检查本层是否有该路径
             candidate = os.path.join(layer.root, p)
             if os.path.exists(candidate):
                 return candidate, layer_idx
             # 检查中间目录是否被 opaque 截断
             # 从完整路径到父目录逐级检查是否有 opq 标记
-            current = parts
             has_opaque = False
-            for i in range(len(current), 0, -1):
-                sub = "/".join(current[:i])
+            for i in range(len(parts), 0, -1):
+                sub = "/".join(parts[:i])
                 opq = os.path.join(layer.root, sub, OPAQUE_MARKER)
                 if os.path.exists(opq):
                     opaque_until_layer = layer_idx
@@ -369,20 +392,26 @@ class LayeredFilesystem:
                     tgt = Layer.whiteout_target(rel)
                     layer_wh.add(tgt)
                     whiteouts.add(tgt)
+
+            def _is_whitelisted(rel_path: str) -> bool:
+                """检查路径本身或任何祖先是否被 whiteout。"""
+                if rel_path in whiteouts:
+                    return True
+                ancestors = _ancestors(rel_path)
+                for anc in ancestors:
+                    if anc in whiteouts:
+                        return True
+                return False
+
             # 现在添加文件, 跳过已处理、whiteout、opaque 影响的下层内容
             for rel, is_dir, is_special in layer.walk_changes():
                 if is_special:
                     continue
-                if rel in whiteouts:
+                if _is_whitelisted(rel):
                     continue
-                # 检查是否在 opaque 目录下且属于下层 (本层的内容不受自己 opaque 影响)
-                # 本层就是当前 layer_idx, 只要之前没被 opaque 屏蔽, 就可以加
-                # 简单判断: 若有任何父目录在 non-current opaque_dirs 中且已经被上层 seen 过, 跳过
-                # 更简单: 只在没有上层覆盖时才加
                 if rel in seen:
                     continue
                 # 检查是否祖先被 opaque 且本层之下 (上层 opaque 意味着下层该目录被忽略)
-                # 上层 (layer_idx 更大的层) 产生的 opaque 才影响本层
                 skip_by_opaque = False
                 ancestors = _ancestors(rel)
                 for anc in ancestors:

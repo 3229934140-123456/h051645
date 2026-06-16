@@ -26,7 +26,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from .cache import LayerCache
 from .context import BuildContext, EmptyContext
@@ -658,9 +658,17 @@ class Builder:
             shutil.rmtree(fs_dir, ignore_errors=True)
 
     def _diff_into_layer(self, fs_dir: str, layer: Layer) -> bool:
-        """把 (fs_dir 相对当前层链的差异) 写入 layer。"""
+        """把 (fs_dir 相对当前层链的差异) 写入 layer。
+
+        删除语义:
+          - 文件消失 → 文件级 whiteout (.wh.filename)
+          - 目录消失 → 目录级 whiteout (.wh.dirname)，表示整个目录被删
+          - 父目录被删 → 子项无需单独 whiteout (上层会一次性屏蔽所有下层内容)
+        """
         lfs = LayeredFilesystem(self.layers)
         changed = False
+
+        # --- 检测新增/修改 ---
         for dirpath, dirnames, filenames in os.walk(fs_dir):
             rel_dir = os.path.relpath(dirpath, fs_dir)
             if rel_dir == ".":
@@ -669,7 +677,6 @@ class Builder:
                 rel = os.path.join(rel_dir, dn).replace("\\", "/") if rel_dir else dn
                 existing, _ = lfs.resolve_path(rel)
                 if existing is None:
-                    # 新增目录: 放一个 .keep
                     layer.add_string_content(f"{rel}/.keep", "")
                     changed = True
             for fn in filenames:
@@ -677,7 +684,6 @@ class Builder:
                 abs_new = os.path.join(dirpath, fn)
                 existing, _ = lfs.resolve_path(rel)
                 if existing is None:
-                    # 新增
                     layer.add_file(rel, abs_new)
                     changed = True
                 else:
@@ -695,23 +701,60 @@ class Builder:
                     if not same:
                         layer.add_file(rel, abs_new)
                         changed = True
-        # 检测删除: 遍历层链中存在的文件, 是否在 fs_dir 中消失
-        all_existing_rel: List[str] = []
+
+        # --- 检测删除 (文件 + 目录) ---
+        # 收集层链中所有存在的路径 (文件和目录)
+        existing_files: Set[str] = set()
+        existing_dirs: Set[str] = set()
         for old_layer in self.layers:
             for rel, is_dir, is_special in old_layer.walk_changes():
-                if is_special or is_dir:
+                if is_special:
                     continue
-                all_existing_rel.append(rel)
-        # 去重
-        for rel in sorted(set(all_existing_rel)):
-            abs_expected = os.path.join(fs_dir, rel.lstrip("/"))
-            resolved, _ = lfs.resolve_path(rel)
-            if resolved is None:
+                if is_dir:
+                    existing_dirs.add(rel)
+                else:
+                    existing_files.add(rel)
+                    # 同时补上父目录 (确保目录存在性被检查)
+                    parent = os.path.dirname(rel).replace("\\", "/")
+                    while parent and parent != "/":
+                        existing_dirs.add(parent)
+                        parent = os.path.dirname(parent).replace("\\", "/")
+
+        # 先判断哪些目录整个消失了 (目录级 whiteout)
+        # 按路径长度从浅到深处理，父目录被删则子项跳过
+        removed_dirs: Set[str] = set()
+        all_dirs_sorted = sorted(existing_dirs, key=lambda x: x.count("/"))
+        for d in all_dirs_sorted:
+            # 若父目录已被标记为删除，跳过
+            parent_d = os.path.dirname(d).replace("\\", "/")
+            if parent_d and parent_d in removed_dirs:
+                removed_dirs.add(d)
                 continue
-            if not os.path.exists(abs_expected):
-                # 被 RUN 删除了
-                layer.remove_path(rel)
+            abs_expected = os.path.join(fs_dir, d.lstrip("/"))
+            if not os.path.isdir(abs_expected):
+                # 目录整个消失 → 目录级 whiteout
+                layer.remove_path(d)
+                removed_dirs.add(d)
                 changed = True
+
+        # 再判断文件是否消失 (仅处理不在已删除目录下的文件)
+        for f in sorted(existing_files):
+            # 如果在已删除的目录下 → 跳过 (目录级 whiteout 已覆盖)
+            parent_f = os.path.dirname(f).replace("\\", "/")
+            is_under_removed = False
+            pd = parent_f
+            while pd and pd != "/":
+                if pd in removed_dirs:
+                    is_under_removed = True
+                    break
+                pd = os.path.dirname(pd).replace("\\", "/")
+            if is_under_removed:
+                continue
+            abs_expected = os.path.join(fs_dir, f.lstrip("/"))
+            if not os.path.exists(abs_expected):
+                layer.remove_path(f)
+                changed = True
+
         return changed
 
     def _exec_copy(self, idx: int, step: BuildStep, layer: Layer) -> bool:
@@ -723,13 +766,16 @@ class Builder:
     def _do_copy_or_add(self, idx: int, step: BuildStep, layer: Layer, *, is_add: bool) -> bool:
         if len(step.args) < 2:
             raise RuntimeError("COPY/ADD 缺少参数")
-        srcs = step.args[:-1]
-        dest = step.args[-1]
+        srcs = [self.state.apply_substitutions(s) for s in step.args[:-1]]
+        dest = self.state.apply_substitutions(step.args[-1])
         # 处理相对 workdir
         if not dest.startswith("/"):
             wd = self.state.workdir.rstrip("/") or ""
             dest = f"{wd}/{dest}" if wd else "/" + dest
-        dest = dest.replace("\\", "/")
+        dest_ends_with_slash = dest.endswith("/")
+        dest = os.path.normpath(dest).replace("\\", "/")
+        if dest_ends_with_slash and not dest.endswith("/"):
+            dest += "/"
 
         # 从上下文中收集文件
         matched = self.context.collect_paths(srcs)
@@ -743,13 +789,29 @@ class Builder:
             extra={"matched": matched},
         )
         changed = False
-        for rel in matched:
+        # ADD 时分离 tar 文件和普通条目: tar 直接解压, 不保留原文件
+        tar_items: List[str] = []
+        normal_items: List[str] = []
+        if is_add:
+            for rel in matched:
+                bn = os.path.basename(rel).lower()
+                if bn.endswith((".tar", ".tar.gz", ".tgz")):
+                    ctx_e = self.context.manifest.get(rel)
+                    if ctx_e and not ctx_e.is_dir:
+                        tar_items.append(rel)
+                        continue
+                normal_items.append(rel)
+        else:
+            normal_items = list(matched)
+
+        dest_is_dir = dest.endswith("/") or (len(matched) > 1)
+
+        # 普通文件/目录复制
+        for rel in normal_items:
             ctx_entry = self.context.manifest.get(rel)
             if ctx_entry is None:
                 continue
             src_abs = ctx_entry.abs_path
-            # 目标相对 dest 计算: 如果 dest 以 / 结尾或是目录, 则文件进入 dest/<basename>
-            dest_is_dir = dest.endswith("/") or (len(matched) > 1)
             if ctx_entry.is_dir:
                 # 目录: 把目录树拷进 dest/<name>/
                 target_dir_rel = dest.rstrip("/") + "/" + os.path.basename(rel) if dest_is_dir else dest
@@ -762,37 +824,27 @@ class Builder:
                     target_rel = dest
                 layer.add_file(target_rel, src_abs)
                 changed = True
-        # ADD 额外功能: 自动解压 tar / 下载 URL (这里只实现 tar 解压)
-        if is_add and changed:
-            self._auto_extract_local_tars(layer, matched)
+
+        # ADD: 自动解压 tar 到 dest 目录
+        if is_add and tar_items:
+            for rel in tar_items:
+                ctx_entry = self.context.manifest.get(rel)
+                if ctx_entry is None or ctx_entry.is_dir:
+                    continue
+                try:
+                    extract_dir = tempfile.mkdtemp(prefix="mib-add-extract-")
+                    bn = os.path.basename(rel).lower()
+                    mode = "r:gz" if bn.endswith((".tar.gz", ".tgz")) else "r:"
+                    import tarfile
+                    with tarfile.open(ctx_entry.abs_path, mode) as tf:
+                        tf.extractall(extract_dir)
+                    # 把解压后的内容直接放到 dest 目录下
+                    layer.add_directory_tree(dest.rstrip("/"), extract_dir)
+                    shutil.rmtree(extract_dir, ignore_errors=True)
+                    changed = True
+                except Exception as e:
+                    self._emit("ADD-ERR", f"解压 {rel} 失败: {e}", step_index=idx + 1)
         return changed
-
-    def _auto_extract_local_tars(self, layer: Layer, matched: List[str]) -> None:
-        """识别并解压刚拷入 layer 的 .tar / .tar.gz 文件。"""
-        import tarfile
-        import gzip
-
-        for rel in list(matched):
-            basename = os.path.basename(rel).lower()
-            if not (basename.endswith(".tar") or basename.endswith(".tar.gz") or basename.endswith(".tgz")):
-                continue
-            # 在 layer 的 root 中找到它
-            # 简化: 直接尝试用 context 里的 src_abs 解压
-            ctx_entry = self.context.manifest.get(rel)
-            if ctx_entry is None or ctx_entry.is_dir:
-                continue
-            try:
-                extract_dir = tempfile.mkdtemp(prefix="mib-add-extract-")
-                mode = "r:gz" if basename.endswith((".tar.gz", ".tgz")) else "r:"
-                with tarfile.open(ctx_entry.abs_path, mode) as tf:
-                    tf.extractall(extract_dir)
-                dest_dir = "/".join(["/"] + os.path.dirname(rel).split("/")[-1:]) if "/" in rel else "/"
-                layer.add_directory_tree(dest_dir if dest_dir != "/" else "", extract_dir)
-                shutil.rmtree(extract_dir, ignore_errors=True)
-                # 删除原来的 tar 文件
-                layer.remove_path(rel)
-            except Exception:
-                pass
 
     def _exec_env(self, idx: int, step: BuildStep, layer: Layer) -> bool:
         for k, v in step.kwargs.items():
@@ -802,7 +854,7 @@ class Builder:
 
     def _exec_label(self, idx: int, step: BuildStep, layer: Layer) -> bool:
         for k, v in step.kwargs.items():
-            self.state.labels[k] = v
+            self.state.labels[k] = self.state.apply_substitutions(v)
         self._emit("LABEL", f"设置 {len(step.kwargs)} 个标签", step_index=idx + 1)
         return False
 
@@ -820,18 +872,20 @@ class Builder:
         return True
 
     def _exec_user(self, idx: int, step: BuildStep, layer: Layer) -> bool:
-        self.state.user = step.args[0] if step.args else "root"
+        self.state.user = self.state.apply_substitutions(step.args[0]) if step.args else "root"
         self._emit("USER", f"用户: {self.state.user}", step_index=idx + 1)
         return False
 
     def _exec_expose(self, idx: int, step: BuildStep, layer: Layer) -> bool:
-        self.state.exposed_ports.extend(step.args)
-        self._emit("EXPOSE", f"端口: {', '.join(step.args)}", step_index=idx + 1)
+        expanded = [self.state.apply_substitutions(a) for a in step.args]
+        self.state.exposed_ports.extend(expanded)
+        self._emit("EXPOSE", f"端口: {', '.join(expanded)}", step_index=idx + 1)
         return False
 
     def _exec_volume(self, idx: int, step: BuildStep, layer: Layer) -> bool:
-        self.state.volumes.extend(step.args)
-        self._emit("VOLUME", f"挂载点: {', '.join(step.args)}", step_index=idx + 1)
+        expanded = [self.state.apply_substitutions(a) for a in step.args]
+        self.state.volumes.extend(expanded)
+        self._emit("VOLUME", f"挂载点: {', '.join(expanded)}", step_index=idx + 1)
         return False
 
     def _exec_cmd(self, idx: int, step: BuildStep, layer: Layer) -> bool:

@@ -603,6 +603,273 @@ class TestEndToEnd(unittest.TestCase):
         finally:
             shutil.rmtree(ws, ignore_errors=True)
 
+    def test_e2e_variable_expansion(self):
+        """端到端: 验证 ARG → ENV → WORKDIR/COPY/VOLUME 全链路变量展开。"""
+        ws = tempfile.mkdtemp(prefix="mib-test-e2e-var-")
+        try:
+            ctx_dir = os.path.join(ws, "ctx")
+            os.makedirs(ctx_dir)
+            (Path(ctx_dir) / "hello.txt").write_text("hello\n")
+
+            df = """
+FROM scratch
+ARG VERSION=1.0
+ARG PORT=8080
+ENV APP_VERSION=${VERSION}
+ENV APP_HOME=/opt/app-${APP_VERSION}
+WORKDIR ${APP_HOME}
+COPY hello.txt ${APP_HOME}/
+RUN echo "version=${APP_VERSION}" > ${APP_HOME}/version.txt
+VOLUME ${APP_HOME}/data
+EXPOSE ${PORT}
+USER appuser
+LABEL version=${APP_VERSION}
+"""
+            store = LayerStore(os.path.join(ws, "store"))
+            cache = LayerCache(os.path.join(ws, "cache"), store)
+            ctx = BuildContext(ctx_dir)
+            builder = Builder(
+                layer_store=store,
+                cache=cache,
+                context=ctx,
+                build_args={"VERSION": "2.0"},
+            )
+            result = builder.build_from_dockerfile(df)
+            self.assertTrue(result.success, result.error_message)
+
+            # 检查 state 中的变量都是真实值
+            state = result.final_state
+            self.assertEqual(state.env.get("APP_VERSION"), "2.0")
+            self.assertEqual(state.env.get("APP_HOME"), "/opt/app-2.0")
+            self.assertEqual(state.workdir, "/opt/app-2.0")
+            self.assertEqual(state.user, "appuser")
+            self.assertIn("8080", state.exposed_ports)
+            self.assertIn("/opt/app-2.0/data", state.volumes)
+            self.assertEqual(state.labels.get("version"), "2.0")
+
+            # 验证 materialize 后文件在正确路径下
+            out = os.path.join(ws, "fs")
+            lfs = LayeredFilesystem(result.layers)
+            lfs.materialize(out)
+            self.assertTrue((Path(out) / "opt" / "app-2.0" / "hello.txt").exists())
+            vf = Path(out) / "opt" / "app-2.0" / "version.txt"
+            self.assertTrue(vf.exists())
+            self.assertIn("version=2.0", vf.read_text())
+
+            # 打包 OCI 和 flat tar 都验证一下
+            pkg = Packager(scratch_dir=os.path.join(ws, "scratch"))
+            oci_dir = os.path.join(ws, "oci")
+            pkg.pack_oci_layout(result, oci_dir, name="var-test")
+            self.assertTrue(os.path.isdir(oci_dir))
+
+            ftar = os.path.join(ws, "flat.tar.gz")
+            pkg.pack_flat_tar(result, ftar)
+            self.assertTrue(os.path.exists(ftar))
+
+            # 解压 flat tar 验证路径
+            flat_extract = os.path.join(ws, "flat-extract")
+            os.makedirs(flat_extract)
+            with tarfile.open(ftar, "r:gz") as tf:
+                tf.extractall(flat_extract)
+            self.assertTrue(
+                (Path(flat_extract) / "opt" / "app-2.0" / "hello.txt").exists()
+            )
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_e2e_add_tar_unpack(self):
+        """端到端: 验证 ADD tar 归档直接解到目标目录, 不保留原始 tar。"""
+        ws = tempfile.mkdtemp(prefix="mib-test-e2e-add-")
+        try:
+            ctx_dir = os.path.join(ws, "ctx")
+            os.makedirs(ctx_dir)
+
+            # 造一个 tar 包: 含 a.txt, sub/b.txt
+            tar_path = os.path.join(ctx_dir, "archive.tar")
+            with tarfile.open(tar_path, "w") as tf:
+                info = tarfile.TarInfo(name="a.txt")
+                info.size = 6
+                tf.addfile(info, fileobj=__import__("io").BytesIO(b"hello\n"))
+                info2 = tarfile.TarInfo(name="sub/")
+                info2.type = tarfile.DIRTYPE
+                tf.addfile(info2)
+                info3 = tarfile.TarInfo(name="sub/b.txt")
+                info3.size = 6
+                tf.addfile(info3, fileobj=__import__("io").BytesIO(b"world\n"))
+
+            df = """
+FROM scratch
+WORKDIR /data
+ADD archive.tar /data/
+RUN ls /data > /tmp/list.txt
+"""
+            store = LayerStore(os.path.join(ws, "store"))
+            cache = LayerCache(os.path.join(ws, "cache"), store)
+            ctx = BuildContext(ctx_dir)
+            builder = Builder(layer_store=store, cache=cache, context=ctx)
+            result = builder.build_from_dockerfile(df)
+            self.assertTrue(result.success, result.error_message)
+
+            # 验证 materialize 结果
+            out = os.path.join(ws, "fs")
+            lfs = LayeredFilesystem(result.layers)
+            lfs.materialize(out)
+
+            # a.txt 和 sub/b.txt 应该存在
+            self.assertTrue((Path(out) / "data" / "a.txt").exists())
+            self.assertTrue((Path(out) / "data" / "sub" / "b.txt").exists())
+            # 原始 tar 包不应该存在
+            self.assertFalse((Path(out) / "data" / "archive.tar").exists())
+            self.assertFalse((Path(out) / "archive.tar").exists())
+            # 文件内容正确
+            self.assertEqual(
+                (Path(out) / "data" / "a.txt").read_text(), "hello\n"
+            )
+            self.assertEqual(
+                (Path(out) / "data" / "sub" / "b.txt").read_text(), "world\n"
+            )
+
+            # 验证 OCI 打包后层中没有原始 tar
+            pkg = Packager(scratch_dir=os.path.join(ws, "scratch"))
+            oci_dir = os.path.join(ws, "oci")
+            pkg.pack_oci_layout(result, oci_dir, name="add-test")
+            # 检查所有层的 tar 中都不含 archive.tar
+            import json as _json
+            idx_path = os.path.join(oci_dir, "index.json")
+            with open(idx_path) as f:
+                idx = _json.load(f)
+            manifest_digest = idx["manifests"][0]["digest"].split(":")[1]
+            manifest_path = os.path.join(
+                oci_dir, "blobs", "sha256", manifest_digest
+            )
+            with open(manifest_path) as f:
+                manifest = _json.load(f)
+            for layer_desc in manifest["layers"]:
+                layer_digest = layer_desc["digest"].split(":")[1]
+                layer_blob = os.path.join(
+                    oci_dir, "blobs", "sha256", layer_digest
+                )
+                with tarfile.open(layer_blob, "r") as ltf:
+                    names = ltf.getnames()
+                    self.assertNotIn(
+                        "archive.tar",
+                        names,
+                        f"层 {layer_digest[:12]} 中不应包含原始 tar 包",
+                    )
+
+            # 验证 flat tar 结果
+            ftar = os.path.join(ws, "flat.tar.gz")
+            pkg.pack_flat_tar(result, ftar)
+            flat_extract = os.path.join(ws, "flat-extract")
+            os.makedirs(flat_extract)
+            with tarfile.open(ftar, "r:gz") as tf:
+                tf.extractall(flat_extract)
+            self.assertTrue(
+                (Path(flat_extract) / "data" / "a.txt").exists()
+            )
+            self.assertTrue(
+                (Path(flat_extract) / "data" / "sub" / "b.txt").exists()
+            )
+            self.assertFalse(
+                (Path(flat_extract) / "data" / "archive.tar").exists()
+            )
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
+    def test_e2e_directory_deletion(self):
+        """端到端: 验证 RUN rm -rf /dir 产生目录级 whiteout, 下层内容不冒出。"""
+        ws = tempfile.mkdtemp(prefix="mib-test-e2e-rm-")
+        try:
+            ctx_dir = os.path.join(ws, "ctx")
+            os.makedirs(ctx_dir)
+            (Path(ctx_dir) / "keep.txt").write_text("keep me\n")
+
+            # 第一层建 /app 目录及文件, 第二层删整个 /app 目录
+            df = """
+FROM scratch
+WORKDIR /app
+RUN mkdir -p /app/sub && \
+    echo "file1" > /app/file1.txt && \
+    echo "file2" > /app/sub/file2.txt && \
+    echo "file3" > /app/sub/file3.txt
+COPY keep.txt /app/keep.txt
+RUN rm -rf /app
+RUN mkdir -p /app && echo "new" > /app/new.txt
+"""
+            store = LayerStore(os.path.join(ws, "store"))
+            cache = LayerCache(os.path.join(ws, "cache"), store)
+            ctx = BuildContext(ctx_dir)
+            builder = Builder(layer_store=store, cache=cache, context=ctx)
+            result = builder.build_from_dockerfile(df)
+            self.assertTrue(result.success, result.error_message)
+
+            # 验证 materialize 后 /app 里只有新文件, 旧文件都消失
+            out = os.path.join(ws, "fs")
+            lfs = LayeredFilesystem(result.layers)
+            lfs.materialize(out)
+            app_dir = Path(out) / "app"
+            self.assertTrue(app_dir.exists())
+            self.assertTrue((app_dir / "new.txt").exists())
+            self.assertEqual((app_dir / "new.txt").read_text(), "new\n")
+            # 旧文件全部消失
+            self.assertFalse((app_dir / "file1.txt").exists())
+            self.assertFalse((app_dir / "keep.txt").exists())
+            self.assertFalse((app_dir / "sub").exists())
+
+            # 验证 flat tar 打包结果
+            pkg = Packager(scratch_dir=os.path.join(ws, "scratch"))
+            ftar = os.path.join(ws, "flat.tar.gz")
+            pkg.pack_flat_tar(result, ftar)
+            flat_extract = os.path.join(ws, "flat-extract")
+            os.makedirs(flat_extract)
+            with tarfile.open(ftar, "r:gz") as tf:
+                tf.extractall(flat_extract)
+            self.assertTrue(
+                (Path(flat_extract) / "app" / "new.txt").exists()
+            )
+            self.assertFalse(
+                (Path(flat_extract) / "app" / "file1.txt").exists()
+            )
+            self.assertFalse(
+                (Path(flat_extract) / "app" / "sub").exists()
+            )
+            self.assertFalse(
+                (Path(flat_extract) / "app" / "keep.txt").exists()
+            )
+
+            # 验证 OCI 打包后层叠加结果
+            oci_dir = os.path.join(ws, "oci")
+            pkg.pack_oci_layout(result, oci_dir, name="rm-test")
+            # 从 OCI 中读取层并重新构建 LayeredFilesystem 验证
+            import json as _json
+            idx_path = os.path.join(oci_dir, "index.json")
+            with open(idx_path) as f:
+                idx = _json.load(f)
+            manifest_digest = idx["manifests"][0]["digest"].split(":")[1]
+            manifest_path = os.path.join(
+                oci_dir, "blobs", "sha256", manifest_digest
+            )
+            with open(manifest_path) as f:
+                manifest = _json.load(f)
+            # 找删除层对应的 tar, 检查是否有 .wh.app whiteout 标记
+            found_wh = False
+            for layer_desc in manifest["layers"]:
+                layer_digest = layer_desc["digest"].split(":")[1]
+                layer_blob = os.path.join(
+                    oci_dir, "blobs", "sha256", layer_digest
+                )
+                with tarfile.open(layer_blob, "r") as ltf:
+                    names = ltf.getnames()
+                    if ".wh.app" in names or "app/.wh..wh..opq" in names:
+                        found_wh = True
+                        break
+            self.assertTrue(
+                found_wh,
+                "删除 /app 目录后层中应该有 .wh.app 或 opaque 标记",
+            )
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
