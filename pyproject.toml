@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-image-builder"
+version = "0.1.0"
+description = "A minimal container image builder that parses Dockerfile-like instructions and produces layered filesystem images"
+requires-python = ">=3.9"
+authors = [{name = "Mini Builder"}]
+dependencies = []
+
+[project.scripts]
+mib = "mini_builder.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
